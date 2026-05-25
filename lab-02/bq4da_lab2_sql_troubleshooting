@@ -1,0 +1,286 @@
+"""
+================================================================================
+BigQuery for Data Analysts — Lab 2 (GSP408)
+Troubleshooting Common SQL Errors with BigQuery
+================================================================================
+
+Dataset : data-to-insights.ecommerce.rev_transactions (public demo dataset)
+Goal    : Use BigQuery's Query Validator to identify and fix syntax errors,
+          logical errors, and common aggregation mistakes in Standard SQL.
+
+Skills demonstrated:
+    - Reading and acting on Query Validator feedback
+    - Fixing missing SELECT fields, wrong bracket syntax, and missing commas
+    - Correcting GROUP BY and aggregation errors
+    - Understanding when to use WHERE vs HAVING on aggregate expressions
+    - Using COUNT(DISTINCT ...) correctly to avoid double-counting
+    - Building iteratively toward a correct, production-ready query
+
+Note: These queries are written in BigQuery Standard SQL.
+      Each task section shows the broken query first, then the fix, with
+      annotations explaining the exact error and why the fix works.
+================================================================================
+"""
+
+
+# ==============================================================================
+# TASK 1 — Troubleshoot Syntax, Alias, and Comma Errors
+# ==============================================================================
+# Scenario: your data analyst team has provided the rev_transactions table.
+# Your goal is to build a query counting unique visitors who completed checkout.
+# Before you get there, you first need to fix a series of broken queries using
+# the BigQuery Query Validator as your guide.
+# ==============================================================================
+
+# ── Error 1: Typo in project name and missing SELECT field list ──────────────
+# BQ raises "Table not found" — the project name is misspelled ("data-to-inghts")
+# and there is no field list after SELECT.
+
+QUERY_BROKEN_typo_and_missing_fields = """
+SELECT  FROM `data-to-inghts.ecommerce.rev_transactions` LIMIT 1000
+"""
+
+# ── Error 2: Legacy SQL bracket syntax in Standard SQL mode ──────────────────
+# Square brackets and colon separators are Legacy SQL syntax.
+# Standard SQL requires backticks and dot-notation.
+
+QUERY_BROKEN_legacy_brackets = """
+SELECT * FROM [data-to-insights:ecommerce.rev_transactions] LIMIT 1000
+"""
+
+# ── Error 3: SELECT with no field list and no LIMIT ──────────────────────────
+# SELECT alone without any columns is invalid — BQ requires at least one
+# field or wildcard (*).
+
+QUERY_BROKEN_empty_select = """
+SELECT FROM `data-to-insights.ecommerce.rev_transactions`
+"""
+
+# ── Fix: valid single-field SELECT ───────────────────────────────────────────
+
+QUERY_FIXED_single_field = """
+SELECT
+    fullVisitorId
+FROM `data-to-insights.ecommerce.rev_transactions`;
+"""
+
+# ── Error 4: Missing comma between field aliases ──────────────────────────────
+# Without a comma, BigQuery interprets `hits_page_pageTitle` as an alias for
+# fullVisitorId, not a second column — silent logic error, not a syntax error.
+
+QUERY_BROKEN_missing_comma = """
+SELECT fullVisitorId hits_page_pageTitle
+FROM `data-to-insights.ecommerce.rev_transactions` LIMIT 1000
+"""
+
+# ── Fix: correct comma-separated field list ───────────────────────────────────
+
+QUERY_FIXED_comma = """
+SELECT
+    fullVisitorId,
+    hits_page_pageTitle
+FROM `data-to-insights.ecommerce.rev_transactions` LIMIT 1000;
+"""
+
+# ── Error 5: COUNT without DISTINCT on a non-unique field ─────────────────────
+# COUNT(fullVisitorId) counts every row, including multiple sessions per visitor.
+# Missing GROUP BY on hits_page_pageTitle also causes an aggregation error.
+
+QUERY_BROKEN_count_no_distinct_no_group = """
+SELECT
+    COUNT(fullVisitorId) AS visitor_count,
+    hits_page_pageTitle
+FROM `data-to-insights.ecommerce.rev_transactions`
+"""
+
+# ── Fix: COUNT(DISTINCT ...) + GROUP BY ───────────────────────────────────────
+# DISTINCT deduplicates visitors across sessions.
+# GROUP BY is required whenever a non-aggregated column appears in SELECT.
+
+QUERY_FIXED_visitor_count_by_page = """
+SELECT
+    COUNT(DISTINCT fullVisitorId)   AS visitor_count,
+    hits_page_pageTitle
+FROM `data-to-insights.ecommerce.rev_transactions`
+GROUP BY hits_page_pageTitle;
+"""
+
+
+# ==============================================================================
+# TASK 2 — City-Level Transaction Analysis
+# ==============================================================================
+# Build a query iteratively to find which cities generate the highest average
+# number of products ordered per visitor. Each step introduces a new concept
+# or fixes a logical error from the previous version.
+# ==============================================================================
+
+# ── Step 1: Broken GROUP BY — unaggregated column in SELECT ───────────────────
+# totals_transactions is included in SELECT without being inside an aggregate
+# function AND without being in GROUP BY. This causes BQ to error with:
+# "SELECT list expression references column totals_transactions which is
+#  neither grouped nor aggregated."
+
+QUERY_BROKEN_bad_group_by = """
+SELECT
+    geoNetwork_city,
+    totals_transactions,
+    COUNT(DISTINCT fullVisitorId) AS distinct_visitors
+FROM `data-to-insights.ecommerce.rev_transactions`
+GROUP BY geoNetwork_city
+"""
+
+# ── Step 2: Fix aggregation — wrap in SUM(), remove from GROUP BY ─────────────
+# SUM(totals_transactions) collapses all rows per city into one aggregate figure.
+# The query now runs cleanly but has no ordering — hard to derive insight from.
+
+QUERY_FIXED_sum_aggregation = """
+SELECT
+    geoNetwork_city,
+    SUM(totals_transactions)        AS totals_transactions,
+    COUNT(DISTINCT fullVisitorId)   AS distinct_visitors
+FROM `data-to-insights.ecommerce.rev_transactions`
+GROUP BY geoNetwork_city;
+"""
+
+# ── Step 3: Add ORDER BY to surface top cities ────────────────────────────────
+# Ordering by distinct_visitors descending shows the most visited cities first.
+# Useful sanity check: large cities should appear at the top.
+
+QUERY_ORDERED_by_visitors = """
+SELECT
+    geoNetwork_city,
+    SUM(totals_transactions)        AS totals_transactions,
+    COUNT(DISTINCT fullVisitorId)   AS distinct_visitors
+FROM `data-to-insights.ecommerce.rev_transactions`
+GROUP BY geoNetwork_city
+ORDER BY distinct_visitors DESC;
+"""
+
+# ── Step 4: Add avg_products_ordered — a derived efficiency metric ────────────
+# Dividing total products ordered by distinct visitors gives a per-capita
+# purchase rate — more meaningful than raw totals for comparing cities of
+# different sizes. Ordered by this metric to find high-converting cities.
+
+QUERY_WITH_AVG_PRODUCTS = """
+SELECT
+    geoNetwork_city,
+    SUM(totals_transactions)                                    AS total_products_ordered,
+    COUNT(DISTINCT fullVisitorId)                               AS distinct_visitors,
+    SUM(totals_transactions) / COUNT(DISTINCT fullVisitorId)    AS avg_products_ordered
+FROM `data-to-insights.ecommerce.rev_transactions`
+GROUP BY geoNetwork_city
+ORDER BY avg_products_ordered DESC;
+"""
+
+# ── Step 5: Broken filter — WHERE on an aggregate expression ──────────────────
+# avg_products_ordered is a calculated aggregate; it does not exist as a column
+# at the row-filtering stage (WHERE runs before GROUP BY). BQ raises:
+# "Unrecognized name: avg_products_ordered"
+
+QUERY_BROKEN_where_on_aggregate = """
+SELECT
+    geoNetwork_city,
+    SUM(totals_transactions)                                    AS total_products_ordered,
+    COUNT(DISTINCT fullVisitorId)                               AS distinct_visitors,
+    SUM(totals_transactions) / COUNT(DISTINCT fullVisitorId)    AS avg_products_ordered
+FROM `data-to-insights.ecommerce.rev_transactions`
+WHERE avg_products_ordered > 20
+GROUP BY geoNetwork_city
+ORDER BY avg_products_ordered DESC
+"""
+
+# ── Step 6 (Final): Fix with HAVING — filter after aggregation ────────────────
+# HAVING filters on the result of GROUP BY aggregation, which is why it can
+# reference avg_products_ordered. Rule of thumb: WHERE filters rows before
+# grouping; HAVING filters groups after aggregation.
+
+QUERY_FINAL_city_transactions = """
+SELECT
+    geoNetwork_city,
+    SUM(totals_transactions)                                    AS total_products_ordered,
+    COUNT(DISTINCT fullVisitorId)                               AS distinct_visitors,
+    SUM(totals_transactions) / COUNT(DISTINCT fullVisitorId)    AS avg_products_ordered
+FROM `data-to-insights.ecommerce.rev_transactions`
+GROUP BY geoNetwork_city
+HAVING avg_products_ordered > 20
+ORDER BY avg_products_ordered DESC;
+"""
+
+
+# ==============================================================================
+# TASK 3 — Product Category Analysis
+# ==============================================================================
+# Identify how many distinct products exist per category. This task highlights
+# the COUNT vs COUNT(DISTINCT ...) distinction and demonstrates why NULL
+# filtering matters before aggregating on a dimension field.
+# ==============================================================================
+
+# ── Step 1: Explore raw product name + category combinations ──────────────────
+# GROUP BY 1, 2 is shorthand for grouping by the first and second SELECT columns.
+# Useful for quick exploration but can obscure intent in production queries —
+# prefer explicit column names for readability and maintainability.
+
+QUERY_EXPLORE_product_categories = """
+SELECT
+    hits_product_v2ProductName,
+    hits_product_v2ProductCategory
+FROM `data-to-insights.ecommerce.rev_transactions`
+GROUP BY 1, 2;
+"""
+
+# ── Step 2: COUNT products per category — includes duplicates ─────────────────
+# COUNT(hits_product_v2ProductName) counts all non-NULL name occurrences,
+# including the same product appearing in multiple sessions. This overstates
+# the true number of distinct products in each category.
+# NULL filter is required because COUNT skips NULLs but GROUP BY does not —
+# without the WHERE, a NULL category row would appear in results.
+
+QUERY_COUNT_products_by_category = """
+SELECT
+    COUNT(hits_product_v2ProductName)   AS number_of_products,
+    hits_product_v2ProductCategory
+FROM `data-to-insights.ecommerce.rev_transactions`
+WHERE hits_product_v2ProductName IS NOT NULL
+GROUP BY hits_product_v2ProductCategory
+ORDER BY number_of_products DESC;
+-- Note: this count includes the same product multiple times across sessions.
+"""
+
+# ── Step 3 (Final): COUNT(DISTINCT ...) for true unique product count ─────────
+# DISTINCT inside COUNT deduplicates product names within each category,
+# giving the true size of the product catalogue per category.
+# LIMIT 5 scopes the output to the top 5 categories — sufficient for a quick
+# catalogue audit without returning the full long tail.
+
+QUERY_FINAL_distinct_products_by_category = """
+SELECT
+    COUNT(DISTINCT hits_product_v2ProductName)  AS number_of_products,
+    hits_product_v2ProductCategory
+FROM `data-to-insights.ecommerce.rev_transactions`
+WHERE hits_product_v2ProductName IS NOT NULL
+GROUP BY hits_product_v2ProductCategory
+ORDER BY number_of_products DESC
+LIMIT 5;
+"""
+
+
+# ==============================================================================
+# TASK 4 — Checkout Confirmation Visitor Count
+# ==============================================================================
+# Final deliverable: count distinct visitors who reached the Checkout
+# Confirmation page — the last step of the purchase funnel.
+#
+# This query ties back to the goal stated at the start of the lab:
+# measure how many unique visitors successfully completed checkout.
+# It can serve as the denominator in a full conversion funnel analysis
+# when combined with the city/product queries above.
+# ==============================================================================
+
+QUERY_FINAL_checkout_confirmation = """
+SELECT
+    COUNT(DISTINCT fullVisitorId)   AS visitor_count,
+    hits_page_pageTitle
+FROM `data-to-insights.ecommerce.rev_transactions`
+WHERE hits_page_pageTitle = 'Checkout Confirmation'
+GROUP BY hits_page_pageTitle;
+"""
