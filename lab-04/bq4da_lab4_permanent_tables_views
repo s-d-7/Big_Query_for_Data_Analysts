@@ -1,0 +1,477 @@
+"""
+================================================================================
+BigQuery for Data Analysts — Lab 4 (GSP410)
+Creating Permanent Tables and Access-Controlled Views in BigQuery
+================================================================================
+
+Dataset : data-to-insights.ecommerce.all_sessions_raw (public Google demo dataset)
+Goal    : Move from ad-hoc querying against a shared public dataset to a governed,
+          production-style data layer — with typed permanent tables, schema
+          constraints, and role-scoped views that restrict data by identity.
+
+Tasks covered:
+    Task 1 — Create a new dataset to store the tables (BQ Console UI step)
+    Task 2 — Troubleshoot CREATE TABLE statements (schema iteration + debugging)
+    Task 3 — Create and govern views (operational views, loss-prevention views,
+              SESSION_USER() row-level access control, view expiration)
+
+Key concepts:
+    - CREATE OR REPLACE TABLE with explicit schema, NOT NULL constraints,
+      and column-level OPTIONS descriptions
+    - CAST() and revenue unit normalization (raw value / 1,000,000)
+    - CREATE OR REPLACE VIEW vs CREATE VIEW (idempotency pitfall)
+    - View-level OPTIONS: description, labels, expiration_timestamp
+    - SESSION_USER() + REGEXP_EXTRACT() for domain-based row filtering
+    - STRING_AGG(DISTINCT ... ORDER BY ... LIMIT N) for nested product lists
+
+Note: These queries target the `ecommerce` dataset in your own GCP project.
+      Replace 'your-domain.com' in access-controlled views with your
+      organisation's domain before deploying to production.
+================================================================================
+"""
+
+
+# ==============================================================================
+# TASK 1 — Create a New Dataset to Store the Tables
+# ==============================================================================
+# This step is performed in the BigQuery Console UI (not SQL):
+#   1. In the BQ explorer, click your project name → Create Dataset
+#   2. Dataset ID  : ecommerce
+#   3. Data region : US (multi-region)
+#   4. Leave all other settings as default → click Create Dataset
+#
+# All permanent tables and views in this lab will be written into this dataset.
+# Using a dedicated dataset separates your curated reporting layer from the
+# raw public source data — a standard data warehouse design principle.
+# ==============================================================================
+
+
+# ==============================================================================
+# TASK 2 — Troubleshoot CREATE TABLE Statements
+# ==============================================================================
+# Scenario: build a permanent snapshot of one day of ecommerce session data
+# (2017-08-01) as a foundation for downstream reporting tables.
+#
+# Each step introduces a schema or field-matching error; the final version is
+# a production-ready revenue transactions table with typed, documented columns.
+# ==============================================================================
+
+# ── Attempt 1: CREATE TABLE without an explicit schema ────────────────────────
+# This runs without error — BQ infers the schema from the SELECT output.
+# Problem: inferred schemas are fragile. If the source table schema changes,
+# your table silently picks up the change on the next CREATE OR REPLACE run.
+# Also: fullVisitorId must appear as the first column per the lab requirement,
+# but SELECT * returns columns in source order — you lose control of ordering
+# and any implicit column-level documentation.
+
+QUERY_BROKEN_no_explicit_schema = """
+CREATE OR REPLACE TABLE ecommerce.all_sessions_raw_20170801
+OPTIONS(
+    description = "Raw data from analyst team — 08/01/2017"
+)
+AS
+SELECT fullVisitorId, *
+FROM `data-to-insights.ecommerce.all_sessions_raw`
+WHERE date = '20170801';
+-- ~56,989 records expected. Schema is inferred — not recommended for production.
+"""
+
+# ── Attempt 2: Schema declared, but SELECT fields don't match ─────────────────
+# The schema block lists (fullVisitorId, channelGrouping) but the SELECT uses *,
+# which returns all ~33 columns from the source table.
+# BQ raises: "CREATE TABLE has schema with 2 column(s), but query has N columns."
+# Rule: when you declare an explicit schema, the SELECT field list must match
+# exactly — same count, same names, same order.
+
+QUERY_BROKEN_schema_field_mismatch = """
+CREATE OR REPLACE TABLE ecommerce.all_sessions_raw_20170801
+(
+    fullVisitorId   STRING  OPTIONS(description = "Unique visitor ID"),
+    channelGrouping STRING  OPTIONS(description = "Channel e.g. Direct, Organic, Referral...")
+)
+OPTIONS(
+    description = "Raw data from analyst team — 08/01/2017"
+)
+AS
+SELECT *  -- ERROR: returns ~33 columns but schema only declares 2
+FROM `data-to-insights.ecommerce.all_sessions_raw`
+WHERE date = '20170801';
+"""
+
+# ── Attempt 3: Schema declared, SELECT fields still don't match column names ──
+# Schema declares channelGrouping but SELECT returns `city` as the second column.
+# BQ raises a column name mismatch error.
+# The fix is to align the SELECT list with the schema declaration — both in count
+# and in the expected column names.
+
+QUERY_BROKEN_column_name_mismatch = """
+CREATE OR REPLACE TABLE ecommerce.all_sessions_raw_20170801
+(
+    fullVisitorId   STRING  OPTIONS(description = "Unique visitor ID"),
+    channelGrouping STRING  OPTIONS(description = "Channel e.g. Direct, Organic, Referral...")
+)
+OPTIONS(
+    description = "Raw data from analyst team — 08/01/2017"
+)
+AS
+SELECT fullVisitorId, city  -- ERROR: 'city' does not match schema field 'channelGrouping'
+FROM `data-to-insights.ecommerce.all_sessions_raw`
+WHERE date = '20170801';
+"""
+
+# ── Attempt 4: Schema, NOT NULL constraints, and matching SELECT ───────────────
+# NOT NULL is a BigQuery schema constraint — it documents intent and prevents
+# downstream tools from treating these columns as nullable, but BQ does NOT
+# enforce NOT NULL at write time (unlike traditional RDBMS). It still serves as
+# authoritative documentation and is respected by some BI connectors.
+# totalTransactionRevenue is INT64 here — still in raw GA units (revenue × 10⁶).
+# This version runs cleanly.
+
+QUERY_WORKING_typed_schema = """
+CREATE OR REPLACE TABLE ecommerce.all_sessions_raw_20170801
+(
+    fullVisitorId           STRING  NOT NULL OPTIONS(description = "Unique visitor ID"),
+    channelGrouping         STRING  NOT NULL OPTIONS(description = "Channel e.g. Direct, Organic, Referral..."),
+    totalTransactionRevenue INT64            OPTIONS(description = "Raw revenue value — multiply by 10⁻⁶ to get USD")
+)
+OPTIONS(
+    description = "Raw ecommerce session data — 08/01/2017"
+)
+AS
+SELECT
+    fullVisitorId,
+    channelGrouping,
+    totalTransactionRevenue
+FROM `data-to-insights.ecommerce.all_sessions_raw`
+WHERE date = '20170801';
+-- ~56,989 records. Schema, constraints, and SELECT are now fully aligned.
+"""
+
+# ── Final: Production revenue transactions table ───────────────────────────────
+# This is the deliverable for Task 2 — a clean, typed, documented permanent table
+# scoped to revenue-bearing sessions only (totalTransactionRevenue IS NOT NULL).
+#
+# Two important transformations applied:
+#   1. CAST(visitId AS STRING): visitId is stored as INT64 in the source but
+#      is semantically an identifier, not a numeric value. Casting prevents
+#      accidental arithmetic and aligns with how it will be used in JOINs.
+#   2. totalTransactionRevenue / 1000000: Google Analytics stores revenue as
+#      an integer scaled by 10⁶ to avoid floating point issues at ingestion.
+#      Dividing by 1,000,000 converts it back to standard currency units (USD).
+#
+# FLOAT64 is the correct type for the normalised revenue column.
+# DISTINCT ensures one row per unique visitor-session-channel-revenue combination.
+
+QUERY_FINAL_revenue_transactions_table = """
+CREATE OR REPLACE TABLE ecommerce.revenue_transactions_20170801
+(
+    fullVisitorId           STRING  NOT NULL OPTIONS(description = "Unique visitor ID"),
+    visitId                 STRING  NOT NULL OPTIONS(description = "Session ID — not unique across all users"),
+    channelGrouping         STRING  NOT NULL OPTIONS(description = "Channel e.g. Direct, Organic, Referral..."),
+    totalTransactionRevenue FLOAT64 NOT NULL OPTIONS(description = "Normalised transaction revenue in USD")
+)
+OPTIONS(
+    description = "Revenue-bearing transactions — 08/01/2017"
+)
+AS
+SELECT DISTINCT
+    fullVisitorId,
+    CAST(visitId AS STRING)                 AS visitId,
+    channelGrouping,
+    totalTransactionRevenue / 1000000       AS totalTransactionRevenue
+FROM `data-to-insights.ecommerce.all_sessions_raw`
+WHERE date = '20170801'
+  AND totalTransactionRevenue IS NOT NULL;
+-- Filters to sessions with confirmed revenue only. Row count will be
+-- significantly lower than the raw snapshot (~56,989 above).
+"""
+
+
+# ==============================================================================
+# TASK 3 — Creating Views
+# ==============================================================================
+# Views are saved queries that behave like virtual tables — they don't store
+# data themselves but execute against the underlying source on every call.
+#
+# Two strategies for keeping reporting current without re-running ETL:
+#   (a) Periodically refresh permanent tables (re-run INSERT/CREATE OR REPLACE)
+#   (b) Use views — always reflect the latest source data automatically
+#
+# This task builds three views of increasing complexity:
+#   vw_latest_transactions   — operational view of the 100 most recent orders
+#   vw_large_transactions    — loss-prevention view: high-value USD orders > $1,000
+#   (final)                  — access-controlled version with SESSION_USER() filter
+# ==============================================================================
+
+# ── Step 1: Preview query before creating the view ────────────────────────────
+# Always run and validate the underlying SELECT before wrapping it in a VIEW.
+# This confirms the logic, checks row counts, and avoids creating a broken view.
+
+QUERY_PREVIEW_latest_transactions = """
+SELECT DISTINCT
+    date,
+    fullVisitorId,
+    CAST(visitId AS STRING)             AS visitId,
+    channelGrouping,
+    totalTransactionRevenue / 1000000   AS totalTransactionRevenue
+FROM `data-to-insights.ecommerce.all_sessions_raw`
+WHERE totalTransactionRevenue IS NOT NULL
+ORDER BY date DESC
+LIMIT 100;
+-- Returns the 100 most recent revenue-bearing transactions across all dates.
+"""
+
+# ── Step 2: Basic view — no OPTIONS metadata ──────────────────────────────────
+# Functional but undocumented. In a team environment, views without description
+# and labels make lineage and ownership tracking difficult.
+# Acceptable for local exploration; not for shared or production datasets.
+
+QUERY_VIEW_latest_transactions_basic = """
+CREATE OR REPLACE VIEW ecommerce.vw_latest_transactions
+AS
+SELECT DISTINCT
+    date,
+    fullVisitorId,
+    CAST(visitId AS STRING)             AS visitId,
+    channelGrouping,
+    totalTransactionRevenue / 1000000   AS totalTransactionRevenue
+FROM `data-to-insights.ecommerce.all_sessions_raw`
+WHERE totalTransactionRevenue IS NOT NULL
+ORDER BY date DESC
+LIMIT 100;
+"""
+
+# ── Step 3: View with OPTIONS — description and classification label ───────────
+# OPTIONS on a view serve two purposes:
+#   - description: human-readable documentation surfaced in the BQ UI and
+#     INFORMATION_SCHEMA — essential for data cataloguing and discoverability
+#   - labels: key-value tags used for cost allocation, access auditing,
+#     and filtering in dashboards (e.g. label by report_type, team, env)
+# This is the production-style approach for any shared view.
+
+QUERY_VIEW_latest_transactions_with_options = """
+CREATE OR REPLACE VIEW ecommerce.vw_latest_transactions
+OPTIONS(
+    description = "Latest 100 ecommerce transactions by date",
+    labels      = [('report_type', 'operational')]
+)
+AS
+SELECT DISTINCT
+    date,
+    fullVisitorId,
+    CAST(visitId AS STRING)             AS visitId,
+    channelGrouping,
+    totalTransactionRevenue / 1000000   AS totalTransactionRevenue
+FROM `data-to-insights.ecommerce.all_sessions_raw`
+WHERE totalTransactionRevenue IS NOT NULL
+ORDER BY date DESC
+LIMIT 100;
+"""
+
+# ── Pitfall: CREATE VIEW without OR REPLACE fails if view already exists ───────
+# CREATE VIEW (without OR REPLACE) errors if the view name already exists:
+# "Already Exists: Table <project>.<dataset>.vw_latest_transactions"
+# Best practice: always use CREATE OR REPLACE VIEW unless you explicitly want
+# the operation to fail on a collision (e.g. in a deployment safety check).
+
+QUERY_BROKEN_create_view_no_replace = """
+CREATE VIEW ecommerce.vw_latest_transactions  -- ERROR if view already exists
+OPTIONS(
+    description = "Latest 50 ecommerce transactions",
+    labels      = [('report_type', 'operational')]
+)
+AS
+SELECT DISTINCT
+    date,
+    fullVisitorId,
+    CAST(visitId AS STRING)             AS visitId,
+    channelGrouping,
+    totalTransactionRevenue / 1000000   AS totalTransactionRevenue
+FROM `data-to-insights.ecommerce.all_sessions_raw`
+WHERE totalTransactionRevenue IS NOT NULL
+ORDER BY date DESC
+LIMIT 50;
+"""
+
+# ── Step 4: Loss-prevention view — high-value USD transactions ────────────────
+# Task: Create a new view that returns all transactions with revenue > $1,000
+# in USD on or after 2017-01-01, limited to the most recent 10.
+#
+# Note: v2ProductName is intentionally excluded at this stage — adding it
+# without a GROUP BY would fan out rows (one row per product per transaction).
+# The next step introduces STRING_AGG to handle that correctly.
+
+QUERY_VIEW_large_transactions_v1 = """
+CREATE OR REPLACE VIEW ecommerce.vw_large_transactions
+OPTIONS(
+    description = "Large transactions for loss-prevention review",
+    labels      = [('org_unit', 'loss_prevention')]
+)
+AS
+SELECT DISTINCT
+    date,
+    fullVisitorId,
+    visitId,
+    channelGrouping,
+    totalTransactionRevenue / 1000000   AS revenue,
+    currencyCode
+    -- v2ProductName excluded here: including it without aggregation would
+    -- create one row per product per transaction, inflating results.
+FROM `data-to-insights.ecommerce.all_sessions_raw`
+WHERE (totalTransactionRevenue / 1000000) > 1000
+  AND currencyCode = 'USD'
+ORDER BY date DESC
+LIMIT 10;
+"""
+
+# ── Validate the view — query it directly ─────────────────────────────────────
+# Always test a newly created view before sharing it with downstream consumers.
+# This also confirms the revenue filter is applied correctly at query time.
+
+QUERY_VALIDATE_large_transactions = """
+SELECT
+    fullVisitorId,
+    revenue,
+    date
+FROM ecommerce.vw_large_transactions
+WHERE revenue > 1000
+ORDER BY date DESC;
+"""
+
+# ── Step 5: Add product list to the large transactions view ───────────────────
+# STRING_AGG(DISTINCT v2ProductName ORDER BY v2ProductName LIMIT 10) collapses
+# multiple product rows per transaction into a single comma-separated string —
+# the correct approach for denormalising a one-to-many relationship in a view.
+#
+# GROUP BY 1,2,3,4,5,6 groups on the first 6 SELECT columns (positional alias
+# for date, fullVisitorId, visitId, channelGrouping, totalTransactionRevenue,
+# currencyCode) — the non-aggregated dimensions. The 7th column (products_ordered)
+# is the aggregated output of STRING_AGG.
+
+QUERY_VIEW_large_transactions_with_products = """
+CREATE OR REPLACE VIEW ecommerce.vw_large_transactions
+OPTIONS(
+    description = "Large transactions for loss-prevention review, with product detail",
+    labels      = [('org_unit', 'loss_prevention')]
+)
+AS
+SELECT DISTINCT
+    date,
+    fullVisitorId,
+    visitId,
+    channelGrouping,
+    totalTransactionRevenue / 1000000                                   AS totalTransactionRevenue,
+    currencyCode,
+    STRING_AGG(DISTINCT v2ProductName ORDER BY v2ProductName LIMIT 10)  AS products_ordered
+FROM `data-to-insights.ecommerce.all_sessions_raw`
+WHERE (totalTransactionRevenue / 1000000) > 1000
+  AND currencyCode = 'USD'
+GROUP BY 1, 2, 3, 4, 5, 6
+ORDER BY date DESC
+LIMIT 10;
+"""
+
+
+# ==============================================================================
+# TASK 3 (CONTINUED) — Row-Level Access Control with SESSION_USER()
+# ==============================================================================
+# Problem: the loss-prevention view currently returns all matching rows to any
+# user who has SELECT access to the view. In practice, sensitive financial data
+# should only be visible to users from authorised internal domains.
+#
+# Solution: filter rows using SESSION_USER() — a BigQuery built-in that returns
+# the email address of the currently authenticated caller. Combined with
+# REGEXP_EXTRACT, you can restrict results to users from specific domains.
+#
+# This is a lightweight form of row-level security (RLS) without requiring
+# separate IAM policies per user — the view itself enforces access logic.
+# ==============================================================================
+
+# ── Step 6: Inspect the current caller's identity ─────────────────────────────
+# Run this before building the access-controlled view to understand the output
+# format of SESSION_USER(). Returns: user@domain.com
+
+QUERY_CHECK_session_user = """
+SELECT SESSION_USER() AS viewer_ldap;
+"""
+
+# ── Step 7: Domain-filtered query with SESSION_USER() ─────────────────────────
+# REGEXP_EXTRACT(SESSION_USER(), r'@(.+)') extracts the domain portion of the
+# caller's email. The IN () list then acts as a domain allowlist.
+#
+# Replace 'your-domain.com' with your organisation's domain before deploying.
+# For multi-domain organisations, add additional values to the IN () list.
+#
+# Note: SESSION_USER() is evaluated at query execution time, not view creation
+# time — so the filter dynamically applies to whoever runs the query.
+
+QUERY_SESSION_USER_domain_filter = """
+SELECT DISTINCT
+    SESSION_USER()                              AS viewer_ldap,
+    REGEXP_EXTRACT(SESSION_USER(), r'@(.+)')    AS domain,
+    date,
+    fullVisitorId,
+    visitId,
+    channelGrouping,
+    totalTransactionRevenue / 1000000           AS totalTransactionRevenue,
+    currencyCode,
+    STRING_AGG(DISTINCT v2ProductName ORDER BY v2ProductName LIMIT 10) AS products_ordered
+FROM `data-to-insights.ecommerce.all_sessions_raw`
+WHERE (totalTransactionRevenue / 1000000) > 1000
+  AND currencyCode = 'USD'
+  AND REGEXP_EXTRACT(SESSION_USER(), r'@(.+)') IN ('your-domain.com')
+  -- Replace 'your-domain.com' with your organisation's verified domain.
+  -- Users outside this domain will receive 0 rows — no error, no data.
+GROUP BY 1, 2, 3, 4, 5, 6, 7, 8
+ORDER BY date DESC
+LIMIT 10;
+"""
+
+# ── Step 8 (Final): Access-controlled view with expiration ────────────────────
+# Combines everything:
+#   - SESSION_USER() domain filter for row-level access control
+#   - expiration_timestamp: auto-expires the view 90 days from creation.
+#     Useful for time-boxed investigations, compliance windows, or temporary
+#     data access grants — the view becomes unavailable after expiry without
+#     any manual intervention.
+#   - All OPTIONS metadata retained for cataloguing and cost attribution.
+#
+# After creating the view, query it with SELECT * to confirm it is working
+# correctly for the current user's domain.
+
+QUERY_FINAL_access_controlled_view = """
+CREATE OR REPLACE VIEW ecommerce.vw_large_transactions
+OPTIONS(
+    description         = "Large transactions for loss-prevention review — domain-restricted",
+    labels              = [('org_unit', 'loss_prevention')],
+    expiration_timestamp = TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 90 DAY)
+)
+AS
+SELECT DISTINCT
+    SESSION_USER()                                                      AS viewer_ldap,
+    REGEXP_EXTRACT(SESSION_USER(), r'@(.+)')                            AS domain,
+    date,
+    fullVisitorId,
+    visitId,
+    channelGrouping,
+    totalTransactionRevenue / 1000000                                   AS totalTransactionRevenue,
+    currencyCode,
+    STRING_AGG(DISTINCT v2ProductName ORDER BY v2ProductName LIMIT 10)  AS products_ordered
+FROM `data-to-insights.ecommerce.all_sessions_raw`
+WHERE (totalTransactionRevenue / 1000000) > 1000
+  AND currencyCode = 'USD'
+  AND REGEXP_EXTRACT(SESSION_USER(), r'@(.+)') IN ('your-domain.com')
+  -- Replace 'your-domain.com' with your organisation's verified domain.
+GROUP BY 1, 2, 3, 4, 5, 6, 7, 8
+ORDER BY date DESC
+LIMIT 10;
+"""
+
+# ── Validate: query the final view ────────────────────────────────────────────
+# Run this after creating the access-controlled view to confirm it resolves
+# correctly and that the SESSION_USER() filter is being applied as expected.
+# Users outside the allowed domain will see 0 rows.
+
+QUERY_VALIDATE_final_view = """
+SELECT * FROM ecommerce.vw_large_transactions;
+"""
