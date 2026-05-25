@@ -1,0 +1,308 @@
+"""
+================================================================================
+BigQuery for Data Analysts — Lab 1
+Exploring an Ecommerce Dataset using SQL in Google BigQuery
+================================================================================
+
+Dataset : data-to-insights.ecommerce.all_sessions_raw / all_sessions
+Source  : Google Analytics records for the Google Merchandise Store
+Goal    : EDA, duplicate detection, product analytics, funnel analysis
+
+Topics covered:
+    - Schema inspection & duplicate row detection
+    - Unique visitor and traffic source analysis
+    - Product view and order metrics
+    - Conversion rate analysis
+    - Checkout funnel tracking via CASE statements
+    - Abandoned cart identification using session-level aggregation
+
+Note: These queries are written in BigQuery Standard SQL.
+      Run them directly in the BigQuery console or via the BQ Python SDK.
+================================================================================
+"""
+
+
+# ==============================================================================
+# SECTION 1 — Duplicate Detection
+# ==============================================================================
+# Before any analysis, it's critical to audit raw data for duplicate records.
+# The all_sessions_raw table is the unfiltered source; the all_sessions table
+# has already been deduplicated by the data engineering team. We verify both.
+# ==============================================================================
+
+# Task 1a: Identify duplicate rows in the raw table
+# Groups on all meaningful fields; HAVING filters to rows appearing more than once.
+# This is a defensive data quality check — always run it before trusting a new dataset.
+
+QUERY_DUPLICATES_RAW = """
+SELECT
+    COUNT(*) AS num_duplicate_rows,
+    *
+FROM `data-to-insights.ecommerce.all_sessions_raw`
+GROUP BY
+    fullVisitorId, channelGrouping, time, country, city,
+    totalTransactionRevenue, transactions, timeOnSite, pageviews,
+    sessionQualityDim, date, visitId, type, productRefundAmount,
+    productQuantity, productPrice, productRevenue, productSKU,
+    v2ProductName, v2ProductCategory, productVariant, currencyCode,
+    itemQuantity, itemRevenue, transactionRevenue, transactionId,
+    pageTitle, searchKeyword, pagePathLevel1,
+    eCommerceAction_type, eCommerceAction_step, eCommerceAction_option
+HAVING num_duplicate_rows > 1;
+"""
+
+# Task 1b: Confirm the cleaned all_sessions table has no duplicates
+# Schema reference: https://support.google.com/analytics/answer/3437719
+# Key fields are scoped per session hit — not per visitor or per session alone.
+
+QUERY_DUPLICATES_CLEAN = """
+SELECT
+    fullVisitorId,      -- unique visitor identifier
+    visitId,            -- visitors can have multiple visits
+    date,               -- session date as YYYYMMDD string
+    time,               -- hit timestamp; 0 to many per session
+    v2ProductName,      -- not unique (products have size/color variants)
+    productSKU,         -- unique per product variant
+    type,               -- hit type: PAGE, EVENT, TRANSACTION, etc.
+    eCommerceAction_type,   -- e.g. 'add to cart', 'completed checkout'
+    eCommerceAction_step,
+    eCommerceAction_option,
+    transactionRevenue, -- revenue for completed orders
+    transactionId,      -- unique ID for revenue-bearing transactions
+    COUNT(*) AS row_count
+FROM `data-to-insights.ecommerce.all_sessions`
+GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12
+HAVING row_count > 1;
+-- Expected result: 0 rows (no duplicates in the cleaned table)
+"""
+
+
+# ==============================================================================
+# SECTION 2 — Visitor & Traffic Source Analysis
+# ==============================================================================
+# Establish baseline metrics: total product page impressions and unique visitors,
+# then break down visitors by acquisition channel.
+# ==============================================================================
+
+# Task 2a: Total product views vs. unique visitor count
+# product_views counts every row (one row per page hit), not unique visitors.
+# COUNT(DISTINCT fullVisitorId) deduplicates across all sessions.
+
+QUERY_TOTAL_VISITORS = """
+SELECT
+    COUNT(*)                        AS product_views,
+    COUNT(DISTINCT fullVisitorId)   AS unique_visitors
+FROM `data-to-insights.ecommerce.all_sessions`;
+"""
+
+# Task 2b: Unique visitors by acquisition channel
+# channelGrouping reflects Google Analytics attribution (Organic, Direct, Referral, etc.)
+# Useful for understanding which channels drive the most engaged traffic.
+
+QUERY_VISITORS_BY_CHANNEL = """
+SELECT
+    COUNT(DISTINCT fullVisitorId)   AS unique_visitors,
+    channelGrouping
+FROM `data-to-insights.ecommerce.all_sessions`
+GROUP BY channelGrouping
+ORDER BY channelGrouping DESC;
+"""
+
+
+# ==============================================================================
+# SECTION 3 — Product Catalog Analysis
+# ==============================================================================
+# Explore the product catalog: distinct product names, most-viewed products,
+# and deduplication using a CTE to count unique views per visitor.
+# ==============================================================================
+
+# Task 3a: List all distinct product names alphabetically
+# Using GROUP BY instead of DISTINCT to allow adding metrics later if needed.
+
+QUERY_PRODUCT_NAMES = """
+SELECT
+    v2ProductName AS product_name
+FROM `data-to-insights.ecommerce.all_sessions`
+GROUP BY product_name
+ORDER BY product_name;
+"""
+
+# Task 3b: Top 5 most viewed products (raw view count, including repeat views)
+# Filtered to type = 'PAGE' per GA4 convention — product "views" only fire
+# on page-type hits, not on events, transactions, or social interactions.
+
+QUERY_TOP_PRODUCTS_RAW = """
+SELECT
+    COUNT(*)        AS product_views,
+    v2ProductName   AS product_name
+FROM `data-to-insights.ecommerce.all_sessions`
+WHERE type = 'PAGE'
+GROUP BY v2ProductName
+ORDER BY product_views DESC
+LIMIT 5;
+"""
+
+# Task 3c: Top 5 products by unique visitor views (deduplicated)
+# A visitor who views the same product 10 times counts as 1 unique view.
+# CTE pre-aggregates at the visitor-product level before the outer COUNT.
+# This is the analytically correct way to measure product reach.
+
+QUERY_TOP_PRODUCTS_DEDUPLICATED = """
+WITH unique_product_views_by_person AS (
+    -- Step 1: Collapse to one row per visitor-product combination
+    SELECT
+        fullVisitorId,
+        v2ProductName AS product_name
+    FROM `data-to-insights.ecommerce.all_sessions`
+    WHERE type = 'PAGE'
+    GROUP BY fullVisitorId, v2ProductName
+)
+-- Step 2: Count distinct visitors per product
+SELECT
+    COUNT(*)        AS unique_view_count,
+    product_name
+FROM unique_product_views_by_person
+GROUP BY product_name
+ORDER BY unique_view_count DESC
+LIMIT 5;
+"""
+
+# Task 3d: Extend to include order volume and total units ordered
+# COUNT(productQuantity) counts non-NULL rows (i.e., sessions that placed an order).
+# SUM(productQuantity) gives total units across all orders.
+
+QUERY_PRODUCT_VIEWS_AND_ORDERS = """
+SELECT
+    COUNT(*)                AS product_views,
+    COUNT(productQuantity)  AS orders,
+    SUM(productQuantity)    AS quantity_product_ordered,
+    v2ProductName           AS product_name
+FROM `data-to-insights.ecommerce.all_sessions`
+WHERE type = 'PAGE'
+GROUP BY v2ProductName
+ORDER BY product_views DESC
+LIMIT 5;
+"""
+
+# Task 3e: Add average units per order
+# avg_per_order = total units ordered / number of orders
+# Useful for understanding typical basket size by product.
+
+QUERY_PRODUCT_AVG_ORDER = """
+SELECT
+    COUNT(*)                                        AS product_views,
+    COUNT(productQuantity)                          AS orders,
+    SUM(productQuantity)                            AS quantity_product_ordered,
+    SUM(productQuantity) / COUNT(productQuantity)   AS avg_per_order,
+    v2ProductName                                   AS product_name
+FROM `data-to-insights.ecommerce.all_sessions`
+WHERE type = 'PAGE'
+GROUP BY v2ProductName
+ORDER BY product_views DESC
+LIMIT 5;
+"""
+
+
+# ==============================================================================
+# SECTION 4 — Challenge Queries
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Challenge 1: Conversion Rate Analysis
+# ------------------------------------------------------------------------------
+# Find high-volume products (>1,000 units added/ordered) excluding frisbees,
+# and rank them by conversion rate (orders / views).
+#
+# Insight: conversion_rate here is a proxy metric — it compares sessions where
+# a quantity was recorded against total product page views. A rate of 1.0 means
+# every page view resulted in an order, which often signals a direct-link product.
+# ------------------------------------------------------------------------------
+
+QUERY_CONVERSION_RATES = """
+SELECT
+    COUNT(*)                                AS product_views,
+    COUNT(productQuantity)                  AS potential_orders,
+    SUM(productQuantity)                    AS quantity_product_added,
+    COUNT(productQuantity) / COUNT(*)       AS conversion_rate,
+    v2ProductName                           AS product_name
+FROM `data-to-insights.ecommerce.all_sessions`
+WHERE LOWER(v2ProductName) NOT LIKE '%frisbee%'
+GROUP BY v2ProductName
+HAVING quantity_product_added > 1000
+ORDER BY conversion_rate DESC
+LIMIT 10;
+"""
+
+# ------------------------------------------------------------------------------
+# Challenge 2: Checkout Funnel — Action Type Breakdown
+# ------------------------------------------------------------------------------
+# Map the eCommerceAction_type codes to human-readable funnel stages.
+# This query gives a visitor count at each stage of the purchase journey.
+#
+# Action type mapping (from GA Enhanced Ecommerce):
+#   0 = Unknown             4 = Remove from cart
+#   1 = Product list click  5 = Check out
+#   2 = Product detail view 6 = Completed purchase
+#   3 = Add to cart         7 = Refund  |  8 = Checkout options
+# ------------------------------------------------------------------------------
+
+QUERY_CHECKOUT_FUNNEL = """
+SELECT
+    COUNT(DISTINCT fullVisitorId)   AS number_of_unique_visitors,
+    eCommerceAction_type
+FROM `data-to-insights.ecommerce.all_sessions`
+GROUP BY eCommerceAction_type
+ORDER BY eCommerceAction_type;
+"""
+
+# Challenge 2 Bonus: Add readable funnel stage labels via CASE statement
+
+QUERY_CHECKOUT_FUNNEL_LABELED = """
+SELECT
+    COUNT(DISTINCT fullVisitorId) AS number_of_unique_visitors,
+    eCommerceAction_type,
+    CASE eCommerceAction_type
+        WHEN '0' THEN 'Unknown'
+        WHEN '1' THEN 'Click through of product lists'
+        WHEN '2' THEN 'Product detail views'
+        WHEN '3' THEN 'Add product(s) to cart'
+        WHEN '4' THEN 'Remove product(s) from cart'
+        WHEN '5' THEN 'Check out'
+        WHEN '6' THEN 'Completed purchase'
+        WHEN '7' THEN 'Refund of purchase'
+        WHEN '8' THEN 'Checkout options'
+        ELSE 'ERROR'
+    END AS eCommerceAction_type_label
+FROM `data-to-insights.ecommerce.all_sessions`
+GROUP BY eCommerceAction_type
+ORDER BY eCommerceAction_type;
+"""
+
+# ------------------------------------------------------------------------------
+# Challenge 3: Abandoned Cart Identification
+# ------------------------------------------------------------------------------
+# Isolate high-quality sessions (sessionQualityDim > 60) where a visitor added
+# to cart (action type = '3') but generated zero transaction revenue.
+#
+# Logic:
+#   - CONCAT(fullVisitorId, CAST(visitId AS STRING)) creates a unique session key
+#     since visitId alone is not globally unique (resets per visitor).
+#   - MAX(eCommerceAction_type) captures the furthest point reached in the funnel.
+#   - HAVING filters to sessions stuck at stage 3 with no revenue recorded.
+#
+# These sessions are prime candidates for remarketing and cart recovery campaigns.
+# ------------------------------------------------------------------------------
+
+QUERY_ABANDONED_CARTS = """
+SELECT
+    CONCAT(fullVisitorId, CAST(visitId AS STRING))  AS unique_session_id,
+    sessionQualityDim,
+    SUM(productRevenue)                             AS transaction_revenue,
+    MAX(eCommerceAction_type)                       AS checkout_progress
+FROM `data-to-insights.ecommerce.all_sessions`
+WHERE sessionQualityDim > 60   -- high-intent sessions only
+GROUP BY unique_session_id, sessionQualityDim
+HAVING
+    checkout_progress = '3'                                         -- stopped at 'add to cart'
+    AND (transaction_revenue = 0 OR transaction_revenue IS NULL);   -- no completed purchase
+"""
