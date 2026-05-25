@@ -1,0 +1,234 @@
+"""
+================================================================================
+BigQuery for Data Analysts — Lab 5 (GSP411)
+Ingesting New Datasets into BigQuery
+================================================================================
+
+Dataset : data-to-insights.ecommerce (public Google demo dataset)
+          ecommerce.products (loaded from CSV / Cloud Storage in this lab)
+          ecommerce.products_comments (external table linked to Google Sheets)
+Goal    : Learn how to bring external data into BigQuery from multiple source
+          types and understand the tradeoffs between native and external tables.
+
+Tasks covered:
+    Task 1 — Create a new dataset to store tables (BQ Console UI step)
+    Task 2 — Ingest a new dataset from a CSV file (local upload)
+    Task 3 — Ingest data from Google Cloud Storage (GCS bucket)
+    Task 4 — Ingest a new dataset from a Google Spreadsheet (Drive connector)
+    Task 5 — Save query results back to Google Sheets
+    Task 6 — External table performance and data quality considerations
+
+Key concepts:
+    - Loading structured data from CSV into a native BigQuery table
+    - Schema auto-detection vs explicit schema declaration
+    - Write preference: append vs overwrite when a table already exists
+    - External tables: linking BigQuery to a live Google Sheet via Drive URI
+    - SAFE_DIVIDE() for null-safe division in inventory ratio calculations
+    - Tradeoffs between native BQ storage and external data sources
+
+Note: Tasks 1, 2, 3, and 4 involve UI steps in the BigQuery Console.
+      The SQL queries below correspond to the analytical work done after
+      each ingestion step. All UI steps are documented in comments.
+================================================================================
+"""
+
+
+# ==============================================================================
+# TASK 1 — Create a New Dataset to Store Tables
+# ==============================================================================
+# UI steps (BigQuery Console):
+#   1. Click the View Actions icon next to your Project ID
+#   2. Select Create Dataset
+#   3. Set Dataset ID to: ecommerce
+#   4. Leave all other settings as default
+#   5. Click Create Dataset
+#
+# This is the same ecommerce dataset used in previous labs. If it already
+# exists in your project from a prior lab session, you can skip this task.
+# ==============================================================================
+
+
+# ==============================================================================
+# TASK 2 — Ingest a New Dataset from a CSV
+# ==============================================================================
+# Scenario: your operations team has provided a product inventory CSV with
+# stock levels and restocking lead times. This data does not exist in the
+# existing ecommerce transactional dataset and needs to be loaded separately.
+#
+# UI steps (BigQuery Console):
+#   1. Download the CSV from:
+#      https://storage.googleapis.com/spls/gsp411/exports/products.csv
+#   2. Click View Actions next to the ecommerce dataset > Create Table
+#   3. Source:      Upload | select downloaded file | File format: CSV
+#   4. Destination: Table name: products
+#   5. Schema:      Check Auto Detect
+#   6. Click Create Table
+#
+# Schema auto-detected from the CSV:
+#   SKU                 STRING
+#   name                STRING
+#   orderedQuantity     INTEGER
+#   stockLevel          INTEGER
+#   restockingLeadTime  INTEGER
+#   sentimentScore      FLOAT
+#   sentimentMagnitude  FLOAT
+# ==============================================================================
+
+# Task 2 SQL: Explore the newly loaded products table
+# After loading, validate the data and get a quick feel for the inventory landscape.
+# Ordering by stockLevel descending surfaces the most overstocked products first,
+# which is useful context before doing the restocking analysis in Task 4.
+
+QUERY_TOP_STOCK_LEVELS = """
+SELECT *
+FROM ecommerce.products
+ORDER BY stockLevel DESC
+LIMIT 5;
+-- Returns the 5 products with the highest current stock.
+-- Use this as a basic sanity check after loading: confirm column names,
+-- data types, and that values look reasonable before running deeper analysis.
+"""
+
+
+# ==============================================================================
+# TASK 3 — Ingest Data from Cloud Storage
+# ==============================================================================
+# Same products.csv file, this time loaded directly from a GCS bucket
+# instead of a local upload. This is the preferred approach in production
+# since it avoids file size limits on local uploads and is repeatable.
+#
+# UI steps (BigQuery Console):
+#   1. Click View Actions next to ecommerce dataset > Create Table
+#   2. Source:      Google Cloud Storage
+#                   Bucket path: spls/gsp411/exports/products.csv
+#                   File format: CSV
+#   3. Destination: Table name: products
+#   4. Schema:      Check Auto Detect
+#   5. Click Create Table
+#
+# This will FAIL on the first attempt because the products table already
+# exists from Task 2 and the default write preference is "Write if empty."
+#
+# Fix:
+#   1. Click Go To Job when the error appears
+#   2. Click Repeat Load Job
+#   3. In Advanced Options, change Write Preference to: Overwrite Table
+#   4. Click Create Table
+#
+# Key lesson: always set Write Preference intentionally.
+#   Write if empty  = safe default, fails if table exists
+#   Append to table = adds rows, can create duplicates if re-run
+#   Overwrite table = replaces all data, idempotent and safe for full refreshes
+# ==============================================================================
+
+
+# ==============================================================================
+# TASK 4 — Ingest a New Dataset from a Google Spreadsheet
+# ==============================================================================
+# After saving query results to Sheets (Task 5 below), you link that
+# spreadsheet back into BigQuery as an external table. This creates a live
+# connection: any edits made in the Sheet are reflected immediately when
+# you query the BQ table, with no re-ingestion required.
+#
+# UI steps (BigQuery Console):
+#   1. Click View Actions next to ecommerce dataset > Create Table
+#   2. Source:      Drive
+#                   Drive URI: (paste your Google Sheet share link here)
+#                   File format: Google Sheet
+#   3. Destination: Table type: External Table (leave as default)
+#                   Table name: products_comments
+#   4. Schema:      Check Auto Detect
+#   5. Advanced:    Header rows to skip: 1
+#   6. Click Create Table
+#
+# Note: no load job runs for external tables. BigQuery stores only the
+# connection metadata, not the data itself. The Sheet remains the source
+# of truth and BQ reads it live on every query.
+# ==============================================================================
+
+# Task 4 SQL: Restocking priority analysis
+# SAFE_DIVIDE() is the BigQuery-safe version of the division operator.
+# Regular division (orderedQuantity / stockLevel) raises an error on
+# division by zero. SAFE_DIVIDE() returns NULL instead, which is the
+# correct behavior for products that have stock but zero orders.
+#
+# The ratio (orderedQuantity / stockLevel) represents inventory turnover
+# pressure: a ratio >= 0.8 means 80% or more of current stock has already
+# been ordered, flagging these products as restock candidates.
+# Combined with restockingLeadTime, this surfaces the most urgent items first.
+
+QUERY_RESTOCK_PRIORITY = """
+SELECT
+    *,
+    SAFE_DIVIDE(orderedQuantity, stockLevel) AS ratio
+FROM ecommerce.products
+WHERE orderedQuantity > 0
+  AND SAFE_DIVIDE(orderedQuantity, stockLevel) >= 0.8
+ORDER BY restockingLeadTime DESC;
+-- Products with >= 80% inventory depletion, sorted by longest restock lead time.
+-- These are the highest-risk items: high demand, low remaining stock,
+-- and the slowest to replenish. First candidates for a supplier contact.
+"""
+
+
+# ==============================================================================
+# TASK 5 — Saving Data to Google Sheets
+# ==============================================================================
+# The restock priority query results are saved to Google Sheets so the
+# supply chain team can add operational notes (e.g. "new shipment on the way")
+# directly in the spreadsheet without needing BigQuery access.
+#
+# UI steps:
+#   1. Run QUERY_RESTOCK_PRIORITY above
+#   2. In Query Results, click Save Results > Google Sheets
+#   3. Open the generated spreadsheet
+#   4. Add a new column G with header: comments
+#   5. Add a note in the first data row (e.g. "new shipment on the way")
+#   6. Share the sheet and copy the link
+#   7. Use that link as the Drive URI in Task 4 to create the external table
+# ==============================================================================
+
+# Task 5 SQL: Query the external table to surface non-null comments
+# This query is run after creating the products_comments external table.
+# Filtering WHERE comments IS NOT NULL returns only rows the supply chain
+# team has actively annotated, keeping the output focused and actionable.
+
+QUERY_PRODUCTS_WITH_COMMENTS = """
+SELECT *
+FROM ecommerce.products_comments
+WHERE comments IS NOT NULL;
+-- Returns only products that have been annotated by the supply chain team.
+-- Because this is an external table, re-running this query after editing
+-- the Sheet will reflect the latest comments without any re-ingestion.
+"""
+
+
+# ==============================================================================
+# TASK 6 — External Table Performance and Data Quality Considerations
+# ==============================================================================
+# This task is conceptual rather than SQL-based, but the tradeoffs are
+# important to understand before using external tables in production.
+#
+# External tables (Google Sheets, GCS without loading) vs native BQ tables:
+#
+# EXTERNAL TABLE BENEFITS:
+#   - No ingestion step required: data is always current
+#   - Useful for operational data that changes frequently (e.g. annotations,
+#     config tables, lookup tables managed by non-technical teams)
+#   - Faster to set up for exploratory or one-off analysis
+#
+# EXTERNAL TABLE LIMITATIONS:
+#   - Data consistency is not guaranteed: if the Sheet is edited mid-query,
+#     results may reflect a mix of old and new values
+#   - No BigQuery storage optimization: auto-partitioning, clustering, and
+#     query execution path optimization only apply to native BQ tables
+#   - Some BigQuery functions are unavailable on external tables
+#     (e.g. certain wildcard functions, DML operations)
+#   - Query performance is slower because BQ must read from the external
+#     source on every execution rather than from optimized columnar storage
+#
+# Rule of thumb:
+#   Use external tables for operational lookups and lightweight annotation.
+#   Load into native BQ tables for anything queried frequently, at scale,
+#   or where consistency and performance are business requirements.
+# ==============================================================================
