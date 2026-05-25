@@ -1,0 +1,358 @@
+"""
+================================================================================
+BigQuery for Data Analysts — Lab 3 (GSP412)
+Troubleshooting and Solving Data Join Pitfalls
+================================================================================
+
+Dataset : data-to-insights.ecommerce.all_sessions_raw  (website behavioural data)
+          data-to-insights.ecommerce.products           (inventory / stock levels)
+Goal    : Reverse-engineer table relationships, identify join pitfalls,
+          and apply the correct join type and deduplication strategy.
+
+Join types covered:
+    INNER JOIN  — only matching keys in both tables
+    LEFT JOIN   — all rows from the left table; NULLs where no match on right
+    RIGHT JOIN  — all rows from the right table; NULLs where no match on left
+    FULL JOIN   — all rows from both tables; NULLs wherever a side has no match
+    CROSS JOIN  — Cartesian product (every row × every row)
+
+Key pitfall: Many-to-many relationships on the join key (productSKU) inflate
+             row counts silently — the query succeeds but results are wrong.
+
+Note: These queries are written in BigQuery Standard SQL.
+================================================================================
+"""
+
+
+# ==============================================================================
+# TASK 3 — Examine the Fields
+# ==============================================================================
+# Get oriented with the ecommerce website dataset before writing any joins.
+# The all_sessions_raw table contains raw Google Analytics hit-level data.
+# productSKU and v2ProductName are the candidate join keys to the products table.
+# ==============================================================================
+
+# Task 3: Explore the full product + SKU catalogue on the website
+# DISTINCT here returns unique combinations, not unique SKUs — an important
+# distinction that the next task will expose.
+
+QUERY_PRODUCT_CATALOGUE = """
+SELECT DISTINCT
+    productSKU,
+    v2ProductName
+FROM `data-to-insights.ecommerce.all_sessions_raw`;
+-- Returns ~2,273 rows — but this does NOT mean 2,273 unique SKUs.
+"""
+
+
+# ==============================================================================
+# TASK 4 — Identify a Key Field in the Ecommerce Dataset
+# ==============================================================================
+# Before joining, verify that your intended join key is actually unique.
+# A join key that looks unique can silently fan out rows — one of the most
+# common and damaging mistakes in SQL analytics.
+# ==============================================================================
+
+# Task 4a: Count truly distinct SKUs
+# Result: ~1,909 distinct SKUs vs ~2,273 rows in the previous query.
+# The gap confirms that multiple product names share the same SKU.
+
+QUERY_DISTINCT_SKUS = """
+SELECT DISTINCT
+    productSKU
+FROM `data-to-insights.ecommerce.all_sessions_raw`;
+-- ~1,909 rows — fewer than the SKU+Name query above.
+-- Implication: productSKU is NOT a unique identifier at the name level.
+"""
+
+# Task 4b: Examine the one-to-many relationship (Product Name → SKUs)
+# A single product (e.g., a t-shirt) may have many SKUs for size/colour variants.
+# STRING_AGG collects all SKUs per name into a comma-separated string for review.
+
+QUERY_NAME_TO_SKU = """
+SELECT
+    v2ProductName,
+    COUNT(DISTINCT productSKU)              AS sku_count,
+    STRING_AGG(DISTINCT productSKU LIMIT 5) AS sample_skus
+FROM `data-to-insights.ecommerce.all_sessions_raw`
+WHERE productSKU IS NOT NULL
+GROUP BY v2ProductName
+HAVING sku_count > 1
+ORDER BY sku_count DESC;
+-- Finding: One product name can map to 12+ SKUs (size/colour variants).
+-- This is expected — the problem is the reverse relationship below.
+"""
+
+# Task 4c: Detect the many-to-many problem (SKU → multiple Product Names)
+# Ideally, one SKU identifies exactly one product. Where that breaks down,
+# joining on SKU will create a Cartesian-style fan-out in your results.
+# STRING_AGG surfaces the conflicting names so you can assess data quality.
+
+QUERY_SKU_TO_NAME = """
+SELECT
+    productSKU,
+    COUNT(DISTINCT v2ProductName)               AS product_count,
+    STRING_AGG(DISTINCT v2ProductName LIMIT 5)  AS sample_names
+FROM `data-to-insights.ecommerce.all_sessions_raw`
+WHERE v2ProductName IS NOT NULL
+GROUP BY productSKU
+HAVING product_count > 1
+ORDER BY product_count DESC;
+-- Finding: Some SKUs map to multiple product names (data entry inconsistencies).
+-- This many-to-many relationship will corrupt any aggregation done after a JOIN.
+-- e.g., one SKU with 4 names × inventory row = 4× inflated stock count.
+"""
+
+
+# ==============================================================================
+# TASK 5 — Pitfall: Non-Unique Join Key
+# ==============================================================================
+# Demonstrating what happens when you join on a non-unique key without
+# pre-deduplication. The stock level gets multiplied by the number of
+# matching name variants — wrong results, no error, no warning.
+# ==============================================================================
+
+# Task 5a: Investigate a specific SKU on the website
+# Confirms the problem: one SKU has multiple product name variants on the site.
+
+QUERY_INSPECT_PROBLEM_SKU_WEBSITE = """
+SELECT DISTINCT
+    v2ProductName,
+    productSKU
+FROM `data-to-insights.ecommerce.all_sessions_raw`
+WHERE productSKU = 'GGOEGPJC019099';
+-- Multiple product names for the same SKU = join will fan out rows.
+"""
+
+# Task 5b: Check the same SKU in the inventory table
+# The products table has one clean row per SKU — the join problem is on the
+# website data side, not the inventory side.
+
+QUERY_INSPECT_PROBLEM_SKU_INVENTORY = """
+SELECT
+    SKU,
+    name,
+    stockLevel
+FROM `data-to-insights.ecommerce.products`
+WHERE SKU = 'GGOEGPJC019099';
+-- One row, one stock level. The inflation happens because the website table
+-- has multiple rows for this SKU.
+"""
+
+# Task 5c: Naive INNER JOIN — demonstrates the inflated row count
+# Each distinct product name in all_sessions_raw matches the single inventory
+# row, producing multiple result rows with the same stock level duplicated.
+
+QUERY_NAIVE_JOIN = """
+SELECT DISTINCT
+    website.v2ProductName,
+    website.productSKU,
+    inventory.stockLevel
+FROM `data-to-insights.ecommerce.all_sessions_raw` AS website
+JOIN `data-to-insights.ecommerce.products` AS inventory
+    ON website.productSKU = inventory.SKU
+WHERE website.productSKU = 'GGOEGPJC019099';
+-- DISTINCT helps at the row level, but if you SUM stockLevel here, you will
+-- still over-count because each name variant carries a copy of the stock figure.
+"""
+
+# Task 5d: Attempt to sum stock level — this is WRONG
+# Wrapping the bad join in a CTE and SUMming stockLevel multiplies the true
+# stock figure by the number of name variants. Silent data corruption.
+
+QUERY_INFLATED_STOCK = """
+WITH inventory_per_sku AS (
+    SELECT DISTINCT
+        website.v2ProductName,
+        website.productSKU,
+        inventory.stockLevel
+    FROM `data-to-insights.ecommerce.all_sessions_raw` AS website
+    JOIN `data-to-insights.ecommerce.products` AS inventory
+        ON website.productSKU = inventory.SKU
+    WHERE website.productSKU = 'GGOEGPJC019099'
+)
+SELECT
+    productSKU,
+    SUM(stockLevel) AS total_inventory  -- INCORRECT: summing the same value N times
+FROM inventory_per_sku
+GROUP BY productSKU;
+-- To get the true stock level, query the products table directly — don't SUM
+-- after joining on a non-unique key.
+"""
+
+
+# ==============================================================================
+# TASK 6 — Join Pitfall Solutions
+# ==============================================================================
+# Three complementary fixes:
+#   (a) Pre-deduplicate the name field before joining (ARRAY_AGG / LIMIT 1)
+#   (b) Use LEFT JOIN + WHERE IS NULL to find SKUs missing from inventory
+#   (c) Use RIGHT JOIN + WHERE IS NULL to find inventory items not on the site
+#   (d) Use FULL JOIN to see all gaps in both directions simultaneously
+#   (e) Use CROSS JOIN intentionally for promotional pricing logic
+# ==============================================================================
+
+# Task 6a: Collapse multiple product names to one per SKU using ARRAY_AGG
+# This is the canonical BigQuery approach for resolving many-to-many on strings.
+# LIMIT 1 inside ARRAY_AGG selects an arbitrary representative name — sufficient
+# when you care about the SKU, not which exact name variant to display.
+
+QUERY_ARRAY_AGG_ALL_NAMES = """
+SELECT
+    productSKU,
+    ARRAY_AGG(DISTINCT v2ProductName LIMIT 5) AS product_names
+FROM `data-to-insights.ecommerce.all_sessions_raw`
+WHERE productSKU = 'GGOEGAAX0098'
+GROUP BY productSKU;
+-- ARRAY_AGG natively outputs a repeated field — BigQuery supports nested arrays.
+"""
+
+QUERY_ARRAY_AGG_SINGLE_NAME = """
+SELECT
+    productSKU,
+    ARRAY_AGG(DISTINCT v2ProductName LIMIT 1) AS canonical_name
+FROM `data-to-insights.ecommerce.all_sessions_raw`
+WHERE productSKU = 'GGOEGAAX0098'
+GROUP BY productSKU;
+-- Use this as a subquery/CTE before joining to prevent name fan-out.
+"""
+
+# Task 6b: INNER JOIN — confirm how many SKUs exist in both tables
+# Result: 1,090 SKUs — down from 1,909 distinct website SKUs.
+# 819 website SKUs have no match in the inventory table.
+
+QUERY_INNER_JOIN_SKU_COVERAGE = """
+SELECT DISTINCT
+    website.productSKU  AS website_sku,
+    inventory.SKU       AS inventory_sku
+FROM `data-to-insights.ecommerce.all_sessions_raw` AS website
+JOIN `data-to-insights.ecommerce.products` AS inventory
+    ON website.productSKU = inventory.SKU;
+-- Only 1,090 of the 1,909 website SKUs match inventory records.
+"""
+
+# Task 6c: LEFT JOIN — surface website SKUs with NO inventory record
+# The WHERE inventory.SKU IS NULL filter keeps only the unmatched left-side rows.
+# These are products visible to customers but absent from the stock system — a
+# business-critical data gap worth escalating.
+
+QUERY_LEFT_JOIN_MISSING_INVENTORY = """
+SELECT DISTINCT
+    website.productSKU  AS website_sku,
+    inventory.SKU       AS inventory_sku
+FROM `data-to-insights.ecommerce.all_sessions_raw` AS website
+LEFT JOIN `data-to-insights.ecommerce.products` AS inventory
+    ON website.productSKU = inventory.SKU
+WHERE inventory.SKU IS NULL;
+-- ~819 website SKUs have no corresponding inventory record.
+-- Risk: customers can browse or purchase products with unknown stock status.
+"""
+
+# Task 6d: RIGHT JOIN — surface inventory SKUs NOT listed on the website
+# Reversed: now every inventory row is preserved; NULLs on the left mean
+# the inventory item has no web presence. Useful for identifying dormant stock.
+
+QUERY_RIGHT_JOIN_MISSING_WEBSITE = """
+SELECT DISTINCT
+    website.productSKU      AS website_sku,
+    inventory.*
+FROM `data-to-insights.ecommerce.all_sessions_raw` AS website
+RIGHT JOIN `data-to-insights.ecommerce.products` AS inventory
+    ON website.productSKU = inventory.SKU
+WHERE website.productSKU IS NULL;
+-- Products in inventory that are not listed on the website.
+-- Could indicate discontinued items, pre-launch products, or a catalogue sync issue.
+"""
+
+# Task 6e: FULL JOIN — see all gaps in both directions in one query
+# The OR condition in WHERE captures both left-only and right-only orphan rows.
+# Use this when you need a complete data reconciliation report.
+
+QUERY_FULL_JOIN_ALL_GAPS = """
+SELECT DISTINCT
+    website.productSKU  AS website_sku,
+    inventory.SKU       AS inventory_sku
+FROM `data-to-insights.ecommerce.all_sessions_raw` AS website
+FULL JOIN `data-to-insights.ecommerce.products` AS inventory
+    ON website.productSKU = inventory.SKU
+WHERE website.productSKU IS NULL
+   OR inventory.SKU IS NULL;
+-- Full picture: SKUs on the site with no inventory + inventory with no web listing.
+"""
+
+
+# ==============================================================================
+# SECTION — CROSS JOIN: Promotional Pricing Logic
+# ==============================================================================
+# A CROSS JOIN is rarely the right answer, but it is the right answer here:
+# applying a site-wide discount rate to every clearance product.
+# Every product row is paired with every discount row — intentional Cartesian product.
+#
+# WARNING: If the promotion table grows, so does the output. The final query
+# filters to a single SKU to demonstrate the multiplication effect clearly.
+# ==============================================================================
+
+# Step 1: Create the promotion table with a single initial discount rate
+# (DDL — run once in the BigQuery console; not executable as a Python string)
+
+QUERY_CREATE_PROMOTION_TABLE = """
+CREATE OR REPLACE TABLE ecommerce.site_wide_promotion AS
+SELECT 0.05 AS discount;
+"""
+
+# Step 2: Apply the 5% discount to all clearance products via CROSS JOIN
+
+QUERY_CROSS_JOIN_CLEARANCE = """
+SELECT DISTINCT
+    productSKU,
+    v2ProductCategory,
+    discount
+FROM `data-to-insights.ecommerce.all_sessions_raw` AS website
+CROSS JOIN ecommerce.site_wide_promotion
+WHERE v2ProductCategory LIKE '%Clearance%';
+-- One discount row × all clearance rows = one output row per clearance product.
+"""
+
+# Step 3: Add additional discount tiers (4%, 3%) to the promotion table
+# After inserting, the table has 3 rows — the CROSS JOIN will now triple the output.
+
+QUERY_INSERT_DISCOUNT_TIERS = """
+INSERT INTO ecommerce.site_wide_promotion (discount)
+VALUES (0.04),
+       (0.03);
+"""
+
+QUERY_VERIFY_DISCOUNTS = """
+SELECT discount FROM ecommerce.site_wide_promotion;
+-- Should return: 0.05, 0.04, 0.03
+"""
+
+# Step 4: Re-run the CROSS JOIN — now 3 output rows per clearance product
+# Use this behaviour intentionally (pricing scenarios) or guard against it
+# in production pipelines where unexpected table growth would corrupt results.
+
+QUERY_CROSS_JOIN_MULTI_DISCOUNT = """
+SELECT DISTINCT
+    productSKU,
+    v2ProductCategory,
+    discount
+FROM `data-to-insights.ecommerce.all_sessions_raw` AS website
+CROSS JOIN ecommerce.site_wide_promotion
+WHERE v2ProductCategory LIKE '%Clearance%';
+-- Now returns 3× the rows — one per discount tier per product.
+"""
+
+# Step 5: Scope down to a single SKU to validate the multiplication effect
+
+QUERY_CROSS_JOIN_SINGLE_SKU = """
+SELECT DISTINCT
+    productSKU,
+    v2ProductCategory,
+    discount
+FROM `data-to-insights.ecommerce.all_sessions_raw` AS website
+CROSS JOIN ecommerce.site_wide_promotion
+WHERE v2ProductCategory LIKE '%Clearance%'
+  AND productSKU = 'GGOEGOLC013299';
+-- Should return 3 rows: one per discount rate (0.05, 0.04, 0.03).
+-- Confirms the CROSS JOIN is producing the intended pricing matrix.
+"""
