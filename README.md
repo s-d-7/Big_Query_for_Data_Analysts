@@ -1,6 +1,6 @@
 # BigQuery for Data Analysts
 
-A collection of hands-on labs completed as part of Google's BigQuery for Data Analysts course on Google Cloud Skills Boost. Each lab covers a distinct area of applied SQL and data engineering in BigQuery, using a real Google Analytics ecommerce dataset from the Google Merchandise Store.
+A collection of hands-on labs completed as part of Google's BigQuery for Data Analysts course on Google Cloud Skills Boost. Each lab covers a distinct area of applied SQL and data engineering in BigQuery, using real Google Analytics ecommerce data from the Google Merchandise Store alongside other public Google Cloud datasets.
 
 This repo documents not just the final queries, but the full problem-solving process: broken queries, iterative fixes, and the reasoning behind each decision. The goal is to show how I think through data problems, not just that I can write SQL that runs.
 
@@ -28,11 +28,34 @@ Deep dive into one of the most common and damaging mistakes in SQL analytics: jo
 
 Moves from ad-hoc querying into production data layer design. Covers iterative schema debugging, NOT NULL constraints, revenue unit normalization from raw GA integers to USD, and view governance using `OPTIONS` metadata, `SESSION_USER()` for domain-based row-level access control, and `expiration_timestamp` for time-boxed data access.
 
+### Lab 5 — Ingesting New Datasets into BigQuery
+**File:** `lab-05-ingesting-new-datasets/bq4da_lab5_ingesting_new_datasets.py`
+
+Covers how to bring external data into BigQuery from multiple source types: local CSV upload, Google Cloud Storage, and Google Sheets via the Drive connector. Introduces the tradeoffs between native BigQuery tables and external tables, write preference options, and `SAFE_DIVIDE()` for null-safe inventory ratio calculations.
+
+### Lab 6 — Connected Sheets: Qwik Start
+**File:** `lab-06-connected-sheets/README.md`
+
+Explores BigQuery Connected Sheets, which brings BigQuery's scale directly into Google Sheets for non-technical stakeholders. Covers pivot tables, charts, formulas, the Extract feature for pulling raw data subsets, and scheduled refresh for keeping analyses current. Dataset used: Chicago public taxi trips.
+
+### Lab 7 — Explore and Create Reports with Looker Studio
+**File:** `lab-07-looker-studio/README.md`
+
+Connects BigQuery to Looker Studio to build interactive reports from a live data source. Covers the dimensions vs. metrics distinction, connecting to BigQuery via the native connector, and field type formatting at the report level without modifying the underlying table.
+
+### Lab 8 — Create and Execute a SQL Workflow in Dataform
+**File:** `lab-08-dataform-sql-workflow/bq4da_lab8_dataform_sql_workflow.py`
+
+Introduces Dataform as a SQL workflow tool built into Google Cloud. Covers SQLX file structure, the `ref()` function for automatic dependency management between objects, IAM role configuration for the Dataform service account, and executing a full workflow with logs.
+
+### Lab 9 — Analyze Data with Gemini Assistance
+**File:** `lab-09-gemini-data-analysis/README.md`
+
+Explores Gemini as an AI assistant within BigQuery for generating, completing, and explaining SQL queries using natural language prompts. Covers enabling the Cloud AI Companion API, prompting Gemini for query explanation and generation, and building an ARIMA_PLUS sales forecasting model using BigQuery ML with `ML.FORECAST`.
+
 ---
 
-## Dataset
-
-All labs use Google's public ecommerce demo dataset, available at no cost to any Google Cloud account.
+## Datasets
 
 | Table | Description |
 |-------|-------------|
@@ -40,14 +63,20 @@ All labs use Google's public ecommerce demo dataset, available at no cost to any
 | `data-to-insights.ecommerce.all_sessions` | Cleaned and deduplicated session data |
 | `data-to-insights.ecommerce.rev_transactions` | Revenue-bearing transactions |
 | `data-to-insights.ecommerce.products` | Product inventory with stock levels |
+| `bigquery-public-data.chicago_taxi_trips.taxi_trips` | Chicago public taxi trip records |
+| `bigquery-public-data.thelook_ecommerce.*` | Synthetic ecommerce and digital marketing data |
 
 ---
 
-## How Queries Are Organized
+## How Files Are Organized
 
-Each lab file is a Python script where queries are stored as named string variables. This format was chosen intentionally: it keeps the queries readable and portable, makes the progression from broken to fixed immediately visible through naming conventions (`QUERY_BROKEN_`, `QUERY_FIXED_`, `QUERY_FINAL_`), and makes it easy to integrate with the BigQuery Python SDK when needed.
+Labs with significant SQL work include a Python script where queries are stored as named string variables. This format keeps queries readable and portable, makes the progression from broken to fixed immediately visible through naming conventions (`QUERY_BROKEN_`, `QUERY_FIXED_`, `QUERY_FINAL_`), and makes it straightforward to integrate with the BigQuery Python SDK when needed.
+
+Labs completed primarily through UI tools (Connected Sheets, Looker Studio, Gemini) include a README only, with all key queries and concepts documented there for reference.
 
 ---
 
 [![Google Cloud](https://img.shields.io/badge/Google_Cloud-BigQuery-4285F4?style=flat&logo=google-cloud&logoColor=white)](https://cloud.google.com/bigquery)
 [![SQL](https://img.shields.io/badge/Language-SQL-lightgrey?style=flat)](https://cloud.google.com/bigquery/docs/reference/standard-sql/introduction)
+[![Looker Studio](https://img.shields.io/badge/Looker_Studio-Reports-4285F4?style=flat&logo=google&logoColor=white)](https://lookerstudio.google.com)
+[![Dataform](https://img.shields.io/badge/Dataform-Workflows-34A853?style=flat&logo=google-cloud&logoColor=white)](https://cloud.google.com/dataform)
