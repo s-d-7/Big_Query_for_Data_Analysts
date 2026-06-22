@@ -77,7 +77,3 @@ After a successful execution, Dataform creates the following in your project:
 | `quickstart-table` | Table | `dataform` |
 
 ---
-
-## Note on Lab Format
-
-This lab was completed in the Google Cloud Console using the Dataform UI. The `.py` file in this folder documents the SQLX code written during the lab and annotates each task step for reference. SQLX files are stored and executed inside Dataform itself rather than in the BigQuery query editor.
